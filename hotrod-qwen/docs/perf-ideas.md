@@ -1,0 +1,285 @@
+# Decode performance ideas - scratchpad
+
+Machine: RTX 3060 12 GB, i5-12400F (6 cores / 12 threads, AVX2 + AVX-VNNI), 31 GB RAM, WD Blue SN5000 NVMe (scheduler
+`none`, read_ahead_kb 4096). Model: Qwen3.8-Flash-Next IQ3_S, stand-ins ranks 2-9, MTP spec 4.
+
+**Method:** one change at a time; decide only on alternated A/B pairs on the same binary (single runs vary +-5 tok/s);
+the long-prompt request (`SET=long PICK=3`), greedy so answers must be identical; diagnostics build `strata-jobs`.
+
+## Where a decode window goes (19 Oct, long-prompt answer, ~55-60 ms/window)
+
+| Part | ms/window | Source |
+| --- | ---: | --- |
+| GPU-reach wait (host spins until the GPU reaches the layer) | ~25 | window map |
+| CPU experts compute (pool) | ~10-15 | window map |
+| "jobs": `prefetch()` = synchronous NVMe reads of the layer's CPU experts | ~11-15 | jobs split timers |
+| "jobs": `blob()` waits on in-flight read-ahead | ~2-4 | jobs split timers |
+| plan + act-quant + rest | < 0.5 | window map |
+
+perf (in place): pool workers 92% in the `pause` wait loop (compute ~13% of their time); host hot spot = GPU-progress
+spin; page faults < 0.1% (staged path). Read-ahead uses 9-18% of what it reads; the drive is busy (held-back reads).
+
+## Hardware finding (19 Oct)
+
+The NVMe link runs at PCIe 3.0 (8 GT/s, "downgraded"; the drive is PCIe 4.0): 3.1 GB/s measured (raw direct read). Cause:
+Gigabyte H610M K DDR4 - the M.2 slot is on the H610 chipset (root port 00:1c.4), PCIe 3.0 only; the only CPU slot holds
+the GPU. A 1.4 MB expert needs >= 0.45 ms on this link (measured ~0.55 ms). A board with a Gen 4 M.2 would cut reads
+~1.7x (~5-6 ms/step) - a purchase, the user's call. Consequence: read-splitting (higher queue depth) can save <= ~0.1 ms
+per read here.
+
+## Open ideas (ranked by expected gain)
+
+| # | Idea | Source | Expected | Test | Status |
+| --- | --- | --- | --- | --- | --- |
+| 2 | Fill variant without the kernel's 4 MB fault read-ahead on the expert mapping (MADV_RANDOM / smaller read_ahead_kb) | NVMe research + fill bytes | the fill arm's extra bytes gone - but its faults are per 4 KB page inside the kernels, so likely still slower | A/B | low priority (fill lost, see Tested) |
+| 3 | Persistent fetch thread pool in `fill_many` (today: new `std::thread`s created + joined per call, `expert_source.cpp:1605-1609`) | code audit (verified) | ~13 calls/window x thread create/join, ~0.4-0.8 ms/window (estimate) | A/B | idea |
+| 4 | Staged path pipelining (`STRATA_OVERLAP_COLD=1`, built): ready CPU experts run while the cold ones are read in the background (ColdFetcher), then the cold ones | literature (PowerInfer-2, PreScope) + code audit | ~13 cold reads/step x ~0.25 ms overlap = ~3 ms/step | A/B | **inconclusive, off** - run 2 (exact check): 48.8 / 40.7 vs 44.8 / 50.8 tok/s (pairs disagree); after the ready experts ran the host still waited 11.5-13.6 ms/window for the cold reads (~1.3 cold experts per affected layer, too little ready work to hide them). Won: jobs 14-16 -> 1.4 ms. Lost: the read latency itself (PCIe 3.0 link). Niche: start cold reads before routing is known (#14, #16) |
+| 5 | Demand reads never queue behind speculative ones: cap in-flight read-ahead, or `bfq` + ioprio (ignored under `none`), or cancel stale guesses | NVMe research (verified: scheduler is `none`) | part of the 11-15 ms | A/B (bfq is a system setting - ask) | idea |
+| 6 | Issue the cold reads before the host's activation quantize (reorder c1/c2) | code audit item 12 | small (actq 0.15 ms) | A/B | idea |
+| 7 | One lock + notify per layer in `io_enqueue` instead of per expert | code audit item 7 | microseconds | A/B | idea |
+| 8 | Pool barriers: 4 per CPU layer (`wait_parked` before/after each phase); check cache-line sharing (`perf c2c`), host quantize between phases while workers idle | thread research + code | ~50 us fixed per CPU layer x ~40 layers = ~2 ms/window max | microbench empty batches, then A/B | idea - careful: `wait_parked` guards issue #29 (pool.hpp) |
+| 9 | Better expert predictor for read-ahead (Fate / ProMoE / published d=1 predictor) | literature | only if it clearly beats 18% used | offline on traces first | idea |
+| 10 | Lock held across `cudaEventSynchronize` / `cudaHostAlloc` in `claim_stage` (`expert_source.cpp:1314, 1352`) | code audit | rare; check how often it fires | count first | idea |
+| 11 | `publish_stage` notify_all -> targeted wake | code audit | microseconds | A/B | idea |
+| 12 | HOBBIT-style low-bit fallback for a missed expert while its read is in flight | literature | removes miss stalls, changes answers | answers read by hand | parked - quality trade |
+| 13 | Cache-policy replay on logged routing traces (LRU/LFU/ARC/per-layer budgets, VRAM and RAM tiers) | idea agent (contrarian) | NVMe reads/step 13 -> ~8 (~3-4 ms) if a better policy exists | offline Python on STRATA_ROUTER_TRACE logs | idea - cheap, no engine runs |
+| 14 | Same-layer temporal prior for read-ahead (layer L at token t predicts layer L at t+1) - a different signal from the cross-layer look-ahead | idea agent (model) | if precision >> 18%, part of the 11-15 ms | offline on traces | idea - cheap |
+| 15 | Co-activation layout of experts on disk (one read brings several useful experts) | idea agent (model) | depends on co-activation strength | offline: pairwise co-activation from traces; drop if flat | idea - cheap check |
+| 16 | Predict routing from the MTP draft head's hidden state | idea agent (contrarian) | if used share rises to ~40%, ~5-8 ms | offline: log MTP states beside routing | idea |
+| 17 | More drafts per step (`--spec 5/6`), later a small draft tree | idea agents | +accepted tokens vs + expert union | config-only A/B | idea - cheap |
+| 18 | Split each expert read into parallel chunks (higher queue depth) | idea agent (systems) | <= ~1 ms/step on this PCIe 3.0 link | A/B | low (link-bound) |
+| 19 | Chunked read+compute of one expert (compute rows as they land, same summation order) | idea agent (model) | part of the read time per cold expert | build + A/B | idea - after #4 |
+| 20 | Launch the GPU's shared-expert work for a layer before the host waits on misses | idea agent (systems) | if not already overlapped | check timeline first | idea - verify first |
+| 21 | RAM audit during a long prompt (what evicts expert pages; pin a hot tier) | idea agent (contrarian) | unknown | /proc/meminfo, smaps, fault counters | idea - cheap |
+
+| 22 | Prompt reading: bigger chunk limit (`--prefill auto:16384`) | user: GPU load never reaches 100% on prefill | - | config A/B | **WIN** (19 Oct, 2 pairs): 8,554-token prompt 38.5 / 37.4 s -> 23.4 / 24.6 s (-37%); NVMe read 128 -> 81-89 GB; major faults 41k -> 21k; decode also faster (47.1/53.7, 46.4/54.5 -> 55.1/59.1, 52.9) because less page-cache churn. Production config change pending the user's OK |
+| 23 | Layer-major prefill: each layer runs every chunk before the next layer, so each expert is read once per prompt (prefill.cpp:2513 is chunk-major) | community note (bench/results/2026-10-09-community-p4-prefill-roofline: proposed, never measured) | for prompts above the chunk limit: reads / number of chunks; also less page-cache churn for decode (see #22) | build + A/B | **WIN** (19 Oct, Strata-lm 87eab5de, STRATA_PREFILL_LAYER_MAJOR=1, CPU share off in both arms, 2 pairs): 45,398-token prompt 117.8 / 117.1 s -> 82.0 / 80.5 s (-31%), NVMe 286 GB -> 95 GB (-67%), major faults 85k -> 19k, answer starts identical (greedy parity). Only a 256 MB layer map fit (700 MB refused, GPU full): 86,259 experts streamed, 24,416 reused - next: carve the map from the borrowed cache slots so a whole layer fits (~630 MB) -> ~1 pass. Also: CPU share off cost the default path 150-600 slots (chunk 11,520 -> 9,728, 5 chunks) - check. Earlier note: #22 proved re-reading per chunk is the cost. Design: per layer, phase A = attention + router for every chunk (each chunk's own residual buffer; recurrent state and K/V carry in chunk order within the layer), phase B = stream the union of the layer's routed experts once, phase C = each chunk's expert step from them. Cost: a residual buffer per chunk (~430 MB at 42k tokens: borrowed slots or pinned RAM); the ~600-line chunk loop (layer split, PLE, hand-off, CPU share, look-ahead, K/V streaming) must be split into phases. Size the gain first with #22b |
+| 23-design | Researched design (19 Oct): FlexGen zig-zag (layer-major over all chunks, activations in pinned host RAM, next layer's weights prefetched; arxiv 2303.06865; MoE-Lightning 2411.11217 uses the same order) + oMLX PR #3654 expert-major union (per layer, gather every chunk's routes, stream each expert once, run it over all its tokens in chunk-sized sub-batches; github.com/jundot/omlx/pull/3654). Ours: residual of the whole prompt in pinned RAM (42k x 2560 x 4 B = 430 MB); per layer: attention + router for each chunk in order (recurrent state / K/V carry), then the expert union streamed once through a 2-3 slot ring (double-buffered), then the shared/dense parts. GPU memory = one chunk + the ring, any prompt length. Floor at 3.1 GB/s: ~18 s per pass over non-resident experts. Risks: union ~ all experts at 42k (saving = the removed re-reads), small per-expert GEMMs (use token sub-batches), cancellation mid-prompt | research agent | 42k prompt ~130 s -> ~40-60 s (estimate) | build behind a switch + A/B | design |
+| 22b | Chunk limit 32768 for 33-42k agent prompts (2 chunks instead of 3) | 8095 log: 33-42k-token prompts read in 112-133 s | - | config A/B, 45,398-token prompt (long set PICK=6, CTX=65536) | **no effect**: 102.0 / 97.8 s (16k) vs 104.6 / 100.4 s (32k); the GPU's buffers cap chunks at ~11,520 tokens either way (4 chunks), and the prompt reads 222-236 GB from the NVMe (~4 passes). Only layer-major (#23) removes it |
+| 13/14 | Offline trace replay (trace1.bin, 24,708 tokens x 48 layers, rank 0-1 picks; scripts in the job tmp trace_an/) | idea agents | - | offline | **measured**: RAM tier of R experts, NVMe reads/token (static GPU set, so relative only): R=4,400 (~10 GiB) static most-used 38.5, LRU 8.7, LRU excluding GPU-resident 6.6; R=2,200: 49.6 / 15.2 / 12.1; R=8,800: 23.7 / 3.2 / 2.2. The trace drifts by topic (first-20% hot set covers 71% -> 18-25% later), so a FIXED tier goes stale - ours (--resident-budget-gib, profile-ranked) is fixed. Same-layer prior: t's rank 0-1 -> t+1 at the same layer 25.3% precision/recall; union of last 4 tokens 45% recall (up to 70% on layers 31/39/15/40) - mostly what an LRU keeps anyway. **Next: after the O_DIRECT prompt path is live, A/B fixed 10 GiB tier vs page cache only (an LRU the prompt no longer flushes, and the kernel's own adaptive tier, #27)** |
+| 27 | Adaptive RAM tier: the resident budget grows while RAM is free and shrinks under memory pressure (PSI /proc/pressure/memory, MemAvailable), releasing its least-used experts to the file path | user (19 Oct): "pinning can be dynamically adjusted by the system itself" | keeps the decode gain of a large tier without pressing other programs | map release()/headroom first, then build + A/B | idea. 16 GiB fixed tier: stopped mid-test - the user saw other software slow down under memory pressure (10 GiB stays). Mapped 19 Oct: the tier is ONE arena (pin_cache_complement, expert_source.cpp:2927), no runtime grow/shrink, blob()/resident_blob() hand raw pointers with no lock (complement_ready_ not atomic) - an adaptive tier needs per-slot MADV_DONTNEED (unpinned) + an epoch/lock + a window-boundary safe point. **Simpler route: the page cache IS the kernel's adaptive tier (grows when RAM is free, reclaimed first under pressure); it only fails because prompt reading flushes it - #26 (O_DIRECT prompt reads) would let the page cache do this job, and the fixed tier could shrink.** Test after #26 |
+| 23b | Full-size layer map carved from the borrowed budget (Strata-lm 2f3003a6, STRATA_PREFILL_LM_MAP_MIB, default 700) + O_DIRECT | 19 Oct A/B, 45k prompt, 2 rounds, parity identical in all arms | - | - | **WIN**: 256 MB map 84.5 / 81.5 s (86,259 streamed, 24,416 reused); full map 76.8 / 77.3 s (49,385 streamed, 82,328 reused; 6 chunks instead of 5); **full map + O_DIRECT 75.6 / 75.6 s** (faults 18k -> 5.4k; decode after it 41.9 / 43.7 vs 41.2 / 41.5 tok/s). vs chunk-major ~119 s: -37%. Left: read amplification - 49,385 x 1.4 MB = ~69 GB needed, buffered reads 96 GB (kernel 4 MB fault read-ahead), O_DIRECT 148 GB (read_direct merges windows up to 32 MB across gaps) -> #28 |
+| 28b | Bytes counter (Strata-lm 2b01f7b9): direct reads 81,372 MB requested / 81,423 MB read - NO amplification (Linux read_direct merges only touching windows; my 69 GB estimate used 1.4 MB/expert, an expert is ~2.33 MB with the IQ4_NL down). The 147 GB: 81 GB direct + 31 GB prompt look-ahead pread (14,747 read ahead, 763 used) + decode | counter | - | - | measured |
+| 29 | Prompt look-ahead off with O_DIRECT prompt reads (STRATA_PREFILL_LOOKAHEAD_TOK=0): its page warming is useless when prompt reads bypass the page cache | 28b | - | config A/B, 2 rounds, parity identical | **WIN**: 75.7 / 76.8 -> 73.9 / 73.5 s; NVMe 148 -> 126 GB. Total for the 45k prompt today: 119 s -> 73.5 s (-38%). Now ~half read (126 GB ~ 40 s at 3.1 GB/s), half compute/overhead -> next: the prompt path's own timers |
+| LIVE | Production (Strata merge-v0.1.45, 8618f6b6..7157fb37; engine/strata installed 19 Oct, backup engine/strata.bak-20261019-pre-layermajor): layer-major + borrowed full map + O_DIRECT prompt reads + prompt look-ahead off, all ON by default; layer-major wins over the CPU share; 8095 config's explicit STRATA_PREFILL_LOOKAHEAD_TOK=512 removed | final A/B on 8095's config, 2 rounds | - | - | 45k prompt 119.9 / 118.5 -> 72.0 / 71.8 s (-40%); 8.5k prompt 29.5 / 26.7 -> 25.4 / 25.2 s; decode after the 45k prompt 38.5 / 37.5 -> 44.5 / 43.8 tok/s; NVMe 274 -> 100 GB. **Losing part: decode after the 8.5k prompt 54.2/53.5, 55.4/56.0 -> 52.4/49.6, 52.0/54.3 (~-4%)** - a buffered prompt leaves its experts in the page cache for decode, O_DIRECT does not. Niche next (#30): O_DIRECT only for prompts long enough to flush the cache |
+| 30 | O_DIRECT prompt reads only above a prompt length (buffered below it, where the prompt's experts warm decode) | LIVE row's losing part | recovers the ~4% decode dip after medium prompts, keeps the long-prompt win | build (threshold env) + A/B on 8.5k and 45k | **LOST** (19 Oct, 16384 vs 0, 10 GiB tier): decode after 8.5k +~3% (52.8-54.3 vs 51.4-52.8) but the prompt +4-5 s (30.8 vs 25.3/27.4 s). Default 0 (Strata-lm d87505db); winning part = the decode warmth -> #31. Layer-major residual traffic measured in the same run: 267.8 GB / 10.6 s (45k), 50.4 GB / 2.0 s (8.5k) -> #33 |
+| 32 | **Committed next (user, 19 Oct)**: fixed 10 GiB RAM tier vs page cache (token 1 GiB tier, since O_DIRECT prompt reads need a tier) - the trace replay says recency (LRU, the page cache) needs ~4x fewer reads than a fixed set, and O_DIRECT prompts no longer flush it | #13/14 trace replay + LIVE row | decode read wait ~10 ms/window | config A/B, 8.5k + 45k, decode | **SPLIT** (2 rounds): fixed 10 GiB wins the 8.5k prompt (25.3/25.2 vs 28.4/28.4 s: the tier serves prompt reads, O_DIRECT bypasses the cache) and decode after it (~4%); the page cache wins decode after 45k (+12%: 48.7/47.4 vs 43.2/42.1). User: 1 GiB default (bf713061) + bring the fixed tier's benefits in -> #34 |
+| 34 | Hybrid tier: warm the page cache with the fixed tier's hot set at startup (STRATA_PAGECACHE_WARM_GIB, SCHED_IDLE thread, WILLNEED) + prompt reads take cached blobs from RAM (STRATA_PROMPT_DIRECT_CACHED, mincore per blob) | #32's split | the 8.5k prompt's 3 s and decode's warm start, keeping recency and reclaim | Strata-lm d29194fa (Haiku), A/B with #33 | testing |
+| 35 | STRATA_FUSE_WAIT=2 on sm86 (plan wait folded into its copy; on only for sm75 today, +0.6-1.4% there) | GPU-reach survey 19 Oct (verify.cpp:333-340, 2061) | ~0.5-1.5% of the 25 ms wait | env A/B, decode | **NO GAIN** (19 Oct, 2 rounds): GPU-reach wait 25.10/25.09 base vs 25.35/25.27 ms fused; prompts/decode within noise. The wait kernels are a negligible part of the 25 ms - it is GPU compute (-> #36 stage timers) |
+| 36 | Decode GPU-reach wait (25 ms of 54 ms/window) = GPU critical path after the host's last flag: post(l-1) tail (copy_rows, hit add, combine, gr_write) + pre(l) (attention/GDN, router, doorbell); whole window is one CUDA graph; a flag-B PCIe stall can leak in | survey (verify.cpp:2817-2932) | split it with stage stamps (prof_on_ disables the fusions - don't profile with it) | measure | idea |
+| 33 | **Committed next (user, 19 Oct)**: layer-major's residual traffic - 40 KB/token (2560 x 4 floats with hyper-connections) copied host<->device each layer and chunk on the COMPUTE stream (no overlap): ~175 GB for a 45k prompt, ~14 s if unhidden, of the ~35 s that is not NVMe | estimate, timers built (Strata-lm, "layer-major residual traffic" line) | if confirmed: overlap the copies (a copy stream + double-buffered chunk residuals), or keep more chunks on the GPU - same math | measure, then build + A/B | timers built. NOT zig-zag (FlexGen's reverse chunk order per layer, keeping the turn chunk on the GPU): chunk c at layer l needs the K/V and DeltaNet state of chunks < c at l, so the order stays forward; overlap on a copy stream (2nd residual buffer ~300 MB at 7.5k-token chunks) is the variant |
+| 31 | Always O_DIRECT for the prompt, then warm the page cache with only the experts the prompt's LAST tokens routed to (madvise WILLNEED / a short read) - decode's best predictors by recency (trace: same-layer recency 25-45%) | user question (is the threshold needed with direct streaming?) | removes #30's dip without buffering whole prompts | build + A/B vs #30 | idea - after #30's result |
+| 28 | Cut read amplification on the prompt path: read_direct merges only small gaps (STRATA_DIRECT_MERGE_GAP_KIB), and/or MADV_RANDOM on the mapped path | 23b's bytes | 148 GB -> ~70 GB; read floor ~22 s at 3.1 GB/s | build + A/B | next |
+| 26b | O_DIRECT prompt reads, really active (prompt_copies d42ed859) with layer-major (256 MB map) | 19 Oct 3-arm A/B (Strata-lm a8145930, 45,398-token prompt, 2 rounds, parity identical in all 5 arms) | - | - | **lost as-is, combine**: chunk-major 119.5 / 120.1 s (285 GB, 85k faults); layer-major 81.6 / 80.9 s (95 GB, 18.5k faults); layer-major + O_DIRECT 90.3 / 89.9 s (**202 GB**, 5.3k faults). Won: faults 18.5k -> 5.3k, page cache untouched. Lost: with a 256 MB map ~60% of a layer's experts are re-read for every chunk, and buffered re-reads hit the page cache while O_DIRECT re-reads go to the drive. Niche: with the full-size layer map there are no re-reads, so O_DIRECT keeps only its gain -> A/B after the map build |
+| 26 | O_DIRECT reads on the PROMPT path (never tested: STRATA_PROMPT_DIRECT did nothing because prompt reading streams through its own stager/pread_full, not copy_blobs - user correction 19 Oct) | user | (a) prompt reading runs at ~2.3 GB/s vs the 3.1 GB/s link (230 GB in ~100 s): deeper direct reads, no page-cache copy -> up to ~25%; (b) no page-cache flush by prompts, so decode's hot experts survive a long prompt | map the prompt reader first, then build + A/B | idea |
+| 25 | RAM-resident expert tier (`--resident-budget-gib N`, existing): a fixed RAM budget of experts that chunk passes cannot flush (the page cache is an LRU scanned by 55 GB per chunk - the classic worst case) | code mapping | each chunk's NVMe reads minus the budget; hot decode experts stay in RAM | config A/B (decode + long prompt) | **WIN on decode** (19 Oct, 2 pairs, 10 GiB, STRATA_RESIDENT_PIN=0): whole answer 49.1 / 51.5 -> 55.7 / 53.9 tok/s; window 65.9 / 71.1 -> 59.8 / 62.3 ms; jobs (read wait) 13.6 / 18.1 -> 9.5 / 10.7 ms; CPU 16.4 / 16.7 -> 12.2 / 13.6 ms. Prompt reading unchanged (~26 s, 90 GB). Next: 14-16 GiB budget A/B; production pending the user's OK |
+
+| 24 | Swap-round reads vs demand reads on the drive | user question (are cold 2-9 read?) + log counters | - | counter, one run | **measured - not the cause**: only 1.7-2.0% of swaps were not wholly in RAM (80 of 4,749; 145 of 7,338); background copy time 2.4-3.7 s per answer, off the decode path. The 11-15 ms wait is the CPU's own rank 0-1 misses |
+
+Checked 19 Oct (user question): the CPU computes rank 0-1 picks only (ranks 2-9 always get a resident stand-in, margin
+1e30; CPU picks ~0.76/token/layer, consistent); the read-ahead fetches rank 0-1 only (la_k = 2).
+
+Vetted out: "batch CPU work across draft tokens sharing an expert" (already done: one job carries all its tokens);
+"GPU computes misses over PCIe" (exists as --pcie-frac, tested, 0 chosen); "split the verify batch so GPU and CPU
+overlap" (GPU time is weight-bound - running each layer twice nearly doubles it); "page cache double-holds experts"
+(staging is ~360 MB); "compress experts" (IQ3_S is near-incompressible).
+
+## Losers' winning parts - combine, don't reject (user, 19 Oct: "some part of the idea must be outperforming")
+
+| Idea | Part that won | Part that lost | Niche / combination to try |
+| --- | --- | --- | --- |
+| Fill variant | no whole-layer wait: jobs 15 -> 0.3 ms, window 52.5 vs 59.9 ms (pair 1) | 4 KB page faults inside the kernels (CPU 12 -> 22-27 ms) | #4: staged bulk reads for cold experts + no whole-layer wait; or fill + MADV_POPULATE_READ per expert on the read threads + MADV_RANDOM |
+| Read-ahead | demand wait -3 to 4 ms/window | blob() waits on in-flight guesses (+2 ms) | read-ahead on, demand reads never wait behind a guess (#5) |
+| Predictor read-ahead | long prompt 46.3 vs 40.8 (+13%) | short/tutorial prompts | on only for long contexts |
+| IQ3_S single tokens on our kernel (MT1) | kernel 21 -> 37 GB/s (bench) | something else in the engine (unmeasured) | rerun with the pool phase timers to find the losing part; maybe only where nt>=2 already, or only gate+up |
+| IQ3_S-N4 | 1.6x per core | +22% bytes when RAM-bound (6 threads streaming) | engine test: the pool runs at ~13 GB/s, far from the RAM limit |
+| SMT pool workers | bench +34% at 12 threads | spinning workers starve the engine's other threads | extra workers that sleep instead of spin, or only for gate+up |
+
+## Tested - keep out (19 Oct, alternated pairs unless noted)
+
+| Idea | Result |
+| --- | --- |
+| Fill variant `STRATA_IO_PF_STAGE=0` (kernels read the mapping, no whole-layer wait) | 45.5 / 48.8 vs staged 50.4 / 50.1 tok/s: jobs 15 -> 0.3 ms but CPU 12-13 -> 22-27 ms (page faults inside the kernels), NVMe +15-50% bytes - keep staged |
+
+**Note on the answer check:** greedy answers differ even between two identical default arms (stand-in choices depend on
+the GPU cache at that moment), so live-run answer equality cannot show a change kept the math. Use a fixed-cache check.
+| More pool workers (SMT): 8 / 11 workers | 44.4 / 31.6 vs ~43 tok/s - worse at 11 |
+| `--pool-tasks` 6 / 12 / 18 | no change |
+| aux_cpus=1 | no change |
+| 4 KB vs huge pages for expert bytes (bench) | no difference |
+| IQ3_S single tokens on our kernel (`STRATA_IQ3S_MT1=1`) | bench 21 -> 37 GB/s, engine 48.3/49.0 -> 44.8/46.1 tok/s - worse |
+| R4 interleaved IQ3_S rows (ik_llama idea) | bench = our kernel; dropped |
+| IQ3_S-N4 (4-bit codes, no grid lookup) | bench 1 thread 1.6x, 6 threads 0.84x (RAM-bound, +22% bytes); not built into the engine |
+| Read-ahead off (`STRATA_LOOKAHEAD=0`) | speed noise (49.9/47.0 vs 43.7/51.7); read-ahead saves ~1.5 ms/window of jobs - keep on |
+| Pinned staging buffers | -6% |
+| Prompt reads O_DIRECT | no effect |
+| Predictor-driven CPU read-ahead / confidence gate | no net gain (49.0 vs 49.6) |
+
+| 37 | Page-cache warm size "auto" (user, 19 Oct: "why is 10 GB default - the auto one won"): warm = MemAvailable - 4 GiB headroom at warm time instead of a fixed STRATA_PAGECACHE_WARM_GIB=10 (10 = what #34 measured; the tier itself is the token 1 GiB) | #34 | more prompt reads from RAM when RAM is free; less when busy | Haiku build after the tier-decoupling agent, A/B auto vs 10 | queued |
+
+## 19 Oct evening: decode read-wait round (dev build 96f98570, round 1 only - round 2 stopped by the user)
+
+| Idea | Result | Why |
+| --- | --- | --- |
+| STRATA_FILL_POOL=1 (persistent fill threads) | **no help** (read wait 1358/1163 vs base 1251/1208 ms per request) | thread create/join was only 47-65 ms of ~1.2 s per request |
+| STRATA_IO_DEMAND_FIRST=1 | **no help** (wait moved into blob(): 1501/1088 ms) | decode asks for the expert right after prefetch queues it: worker or host, the same read time is waited |
+| (measurement) the decode read wait | base: 1729 fetches, ~3.5 GB in 1.06 s of fills = **3.3 GB/s = the drive's ceiling** (PCIe 3.0) | only fewer bytes read helps: more of the rank 0-1 misses already in RAM |
+| STRATA_CACHE_LFRU=1 (fixed, 5689e4ad) | **lost**: hit 90.4/89.0% vs 92.1/90.5%, swaps 1187 vs 2578 | churn (~31k promotions and demotions per request: nearly every resident is routed each round, so "proven" means nothing and the 50% cap demotes half each round); recency-picked victims are warmer, fail the gain test more -> fewer useful swaps. Strata's coldest-by-decayed-usage IS solid's "heat" policy; the capped segments need demand admission (solid) to pay |
+| caveat | the A/B drops the page cache per arm: every decode miss is a cold NVMe read, so the test overstates the wait vs a long-running 8095 (page cache keeps ~20 GB of recent experts) | |
+| next | page-cache warm ORDER by profile-v2 counts (10 GiB covers 55% of routing vs 40% in profile order) and a bigger count-ordered warm; the "auto" 23 GiB loss is likely the profile order's cold tail | 3-arm A/B |
+| Page-cache warm ORDER by profile-v2 counts (19 Oct, round 1 only - user stopped round 2) | **no gain**: count order 10 GiB decode 44.6/46.0 tok/s vs profile order 49.4/50.2, hit 92.2 vs 92.0%; count order + auto: 8.5k prompt 16.2 vs 14.8 s, decode 39.3/45.9 | the counts come from one 24.7k-token trace of the predictor tests - their prompts, not these; a bigger warm hurts again. Defaults stay: profile order, warm = a third of RAM (10.31 GiB here) |
+| (measurement) memory reclaim during a drive | 10 GiB arms: 1.5-3.0 M direct-reclaim scans, 1.6-2.7k allocation stalls; auto arm: 14k scans, 48 stalls | NEXT: find who allocates under pressure (prompt's pinned residual buffers ~4 GB at 45k, prompt-cache writes, decode's buffered reads) with per-phase vmstat; if the engine's own allocations stall, allocate them once at start |
+
+## 20 Oct: K/V streaming default, layer-major on the GPU, RAM tier, adaptive replay
+
+| Item | Result | Notes |
+| --- | --- | --- |
+| Slowdown hunt (3 arms: current auto warm / current warm 10 / 15:40 build) | **no code change slowed a fresh engine**: 8.5k 14.8/14.7/14.8 s, decode 53.5-60/54.8-61/52-56 tok/s | the slowdown builds up in long use; RAM trace (STRATA_RAM_TRACE) now records reclaim/refaults per request |
+| GPU look-ahead (STRATA_LOOKAHEAD_GPU) | **win, default**: 48.1 -> 47.2 ms/window, host per-layer 15.8 -> 12.6 ms | the CPU router recompute is gone |
+| QDEDUP with the forked shared stream | **lost**: 59.6 vs 48.1 ms/window | opt-in, off |
+| K/V streaming + layer-major (gate lifted) | works; at 262k the chunk shrinks (7424) | default on from 64k (--kv-resident auto) |
+| Layer-major state on the GPU (D2D) + R-only state + overlapped copies | 8.5k: 50 GB/2.0 s of copies -> 0; 45k: copy time on the compute stream 9.0 -> 2.2 s; 45k prompt 70.6 -> 64.5 s | commits 438b42ee, 8aef269b |
+| Routing replay (trace1, 6438 test windows) | cache policy vs a FIXED set: fast LFU doubles r0-1 hits (0.30 -> 0.64); read-ahead: cross top-2 recall 0.58 / precision 0.56 stays best (temporal prior adds reads, not value) | |
+| Adaptive replay, production's rule | the live rule is fine: margins/floors change nothing, decay 0.9 +0.5 pt; live swaps 12.5/window = every candidate (the adapted cache leaves ~12 new candidates a window) | no tuning |
+| RAM tier (VRAM -> RAM -> NVMe, --resident-budget-gib auto) v1 | **lost** (prompt 27 s, decode 44.5): a RAM budget switched files mode's I/O off | rescued as an overlay |
+| RAM tier overlay v1 (look-ahead never started) | decode +4% (8.5k) / **+32% (45k)**, refaults 1.26M -> 9k; prompts slower (layer-major refused: tier took the RAM floor) | |
+| RAM tier overlay v2 (look-ahead on, E1 spill on) | decode 8.5k 48.7 vs 52.1 (look-ahead's O_DIRECT guesses = pure drive load); 45k prompt 90 s (floor deficit not given back; prompt reads buffered); prompt start delayed by the 1991-expert spill | fixes: floor kept free, give-back covers the deficit, look-ahead off under the tier, spill opt-in, prompt O_DIRECT |
+| Prompt expert-group overlap (STRATA_PF_GROUP_OVERLAP) | **no gain** (17.81/17.72 s, 93.96/94.21 s) | nsys: GPU busy ~8 of 18 s on the 8.5k prompt; experts ~3 s of kernels; the gaps are the per-pass host sync + grouping (345 x ~17 ms), not group serialization -> next: pipeline chunk c+1's routing ahead of chunk c's experts |
+| GDN-mixer damped loop (STRATA_GDN_LOOP, K=2, layers 22-28) | **lost**: decode 54.7 -> 49.8 tok/s (draft acceptance falls), 3 calibration answers correct both ways, no visible gain | matches the Codacus video + arXiv 2605.23872 on untrained hybrid MoE: noise-level; loops need a model trained to loop |
+| 8095 crash (exit -9 at an 81k turn) | **cgroup OOM**, not a code fault: the auto tier (19.89 GiB) was sized before vision, pinned buffers and the server process allocated (same 29 GiB scope), so the first request had 1.22 GiB free against a 2.5 GiB floor; the tier gave RAM back only for prompts and saves, ~1 GiB growth left 0.5 GiB, the file tier thrashed (98 s stall) and the next allocation was killed | fixed below |
+| RAM floor guard (serve loop, each request start) | gives the tier's coldest experts back below floor + margin; given-back places are PARKED (promotions and evictions refilled freed places at once: a 0.71 GiB give-back left available RAM unchanged) and return only above floor + 2 margins; STRATA_RAM_GUARD=0 turns it off | measured live: 0.76 GiB available -> 3.35 GiB given back |
+| RAM amounts measured, not fixed (ram-reserve.json beside vram-reserve.json) | margin = this start's largest one-request drop in available RAM net of the tier's own refill (1.58-1.61 GiB measured); gap = what the engine allocates after the tier is sized, learned from the first request (149-154 MiB); the fixed 4 GiB headroom applies only to a start with nothing learned; the prompt give-back adds the margin once, not on each of its 6 tries | key = GPU/context/K/V/draft + vision + floor |
+| Code review (5 haiku reviewers + /code-review, all findings checked against the code) | fixed: margin chasing the tier's refill, margin ratchet, flapping at margin 0, give-back releasing fresh promotions first, promotion pause counted as starvation, parking places madvise did not free, stale promotion flags, page_cached bounds, pid temp files, one-token self-commit predicate (QFUSE, latent), prompt cache 'held' stale after a thinking wrap (answer_room vs the cache), untimed cancel drain, QUIT before killing a silent engine (keeps the learned profile), refusal kinds; promotions read straight into their tier place (one blob memcpy less) | deferred: K/V trim churn on conversation switches (needs a timing), loop window-size dependence (below) |
+| GDN loop, default ON then OFF again | at --spec 4 it costs 14-18% decode (8.5k 55.2 -> 47.7 tok/s): windows are faster (60.1 -> 56.3 ms) but the MTP drafter reads looped hidden states it was not trained on - shorter drafts (2.76 -> 2.17 a window, the 0.5 gate) and fewer accepted (84 -> 78%), 3.32 -> 2.69 tokens a window. The earlier "~1 s" came from total request time after an eval batch (base decode itself depressed to 44.5). Also: in a T>1 window the looped passes run on looped state, so outputs depend on window size. A one-token window now self-commits with the loop (snapshot loop_st_). | opt-in; next: gate re-fit under the loop, then a closed-form feature adapter at the MTP input; a 200-question eval first. Looping the MTP alone cannot change answers (the target verifies every token) |
+| --spec 5 / 6 (loop on) | **lost**: 8.5k decode 42.1 -> 40.3 -> 32.4 tok/s; windows 56 -> 92 -> 123 ms (more experts staged per window) | spec stays 4 |
+| Prompt staging wait (new timer, STRATA_PREFILL_PHASE_TIMERS) | the launching thread waits on host staging 6.3-7.1 s of a 17.7-18.1 s 8.5k prompt and 22.9-23.8 s of 68 s at 45k (all staged, 0 DMA): the layer-major walk's stager reads O_DIRECT on the critical path, after a per-layer drain (cudaStreamSynchronize for the router) | the 30% GPU idle nsys showed |
+| Prompt read-ahead into stage buffers (STRATA_PROMPT_LOOKAHEAD_IO, default ON) | under O_DIRECT the prompt look-ahead was set to 0 tokens ("it only warms the page cache"), but under the tier overlay warm() reads ahead on the I/O threads into the source's stage buffers; copy_blobs now takes a blob from there before reading O_DIRECT. Two rounds (alternated): **8.5k prompt 18.14 / 18.13 -> 16.94 / 16.83 s (-7%)**, staging wait 7.1 / 6.9 -> 4.4 / 4.4 s, 33% of staged blobs taken; 45k 67.2 / 67.0 -> 67.9 / 67.6 s (+0.9%: the drive is saturated, the guesses compete); decode level | next: only ~1/3 of predictions land - a better prompt predictor or a 45k-aware cap |
+
+### Where it stands (20 Oct evening, this box: RTX 3060 12 GB, 31 GB RAM, PCIe 3.0 NVMe, Qwen3.8 IQ3_S)
+
+| | 9-10 Oct (stock Strata) | 19 Oct morning | 19 Oct evening | 20 Oct evening |
+| --- | --- | --- | --- | --- |
+| decode, short prompts | 17.2 tok/s | ~55-57 | ~52 | ~54-57 |
+| decode after 8.5k | - | 54-56 | 52 / 50 | 53.7 |
+| decode after 45k | - | 38 | 44 (smaller context) | 39.5-41 (262k context, K/V streamed) |
+| 8.5k prompt | - | 27-29.5 s | 25.3 s | **16.9 s** |
+| 45k prompt | - (32k max) | ~120 s | 72 s | **67-68 s** |
+| continue a 45k conversation | full re-read | full re-read | full re-read | **~3 s** (turn checkpoint) |
+| context | 32k | ~64k | - | **262k** (K/V streaming) |
+| OOM safety | - | - | - | floor held each request, margins measured and learned |
+| Norm-preserving loop (STRATA_GDN_LOOP_NORM=1 with STRATA_GDN_LOOP=1, opt-in) | the looped update is rescaled per token to the canonical pass's norm (direction kept, magnitude drift removed at the source; the user's idea: the loop fixes its own side effect, no adapter). 8.5k T=0, two runs: tokens a window off 3.26/3.05, loop 2.57/3.38, **loop+norm 3.48/3.15**; accepted 83/80, 77/86, **88/83%**; decode 54.1/48.4, 47.5/48.9, **51.8/49.6 tok/s** (run 1's gap = a higher read wait, 12.0 vs 7.6 ms) - the drafter penalty is gone. Answers read: no degeneration in any arm; the loop changes the thinking's style, loop+norm stays closer to the unlooped answer | next: 200-question eval loop+norm vs off decides the default |
+| GDN loop + norm, 210 MMLU-Pro questions (T=0, thinking on), loop off vs on, same engine (4dd73df7) | **not worth it, stays off**: 175 vs 180 correct (discordant 2 vs 7, sign test p ~ 0.18); tokens a window 2.35 vs 2.36 and acceptance 76% both (the norm fix holds the drafter), but decode 42.7 -> 38.5 tok/s: read wait 12.6 -> 17.2 ms a window (looped states route later layers to experts the tier/profile were not built for - inferred, hit rate equal 92.7%). Matches the Codacus video: a loop bolted onto an untrained model gives at most noise-level gains; trained looped models (NVIDIA Dory) are where the gain is | code kept opt-in (STRATA_GDN_LOOP, STRATA_GDN_LOOP_NORM) |
+| Stand-ins off (STRATA_ROUTE_RESIDENT=0), 19 questions before it was stopped | decode 12.0 tok/s (hit rate 64.8% vs 92.7%: every missed expert computed on the CPU); too few answers for an accuracy comparison | stand-ins stay the default |
+| Read while typing (warm requests, d0aa072f), live on 8095 | a warm of 90% of an 8.5k prompt, then the full prompt: the real request reused 7,844 tokens and read 739 - **16.8 s -> 5.8 / 6.0 s** to read; the pinned checkpoint works. The 739-token rest reads at ~125 tok/s (the short-read path) | next: the short rest's slower path |
+| Rank 0-1 RAM floor (STRATA_ROUTE_RAM_FLOOR=1, opt-in): a non-VRAM rank 0-1 pick stays exact only when its expert is in the RAM tier, else it takes the stand-in like ranks 2-9 | motivation: 26% of decode time in the 210-question run was the CPU path waiting on SSD fetches (1/3 of CPU-computed experts came from the SSD). Speed A/B, 8.5k + 1000 T=0, alternated off/on/off/on: **42.6 / 49.2 / 45.6 / 62.8 tok/s**, read wait per window 9.8 / 0.1 / 8.0 / 0.0 ms, tokens a window unchanged (3.1-3.3). 8 answers read: no degeneration | answer QUALITY not yet measured (rank 0-1 stand-ins change outputs): next a 60-question MMLU-Pro leg against the loop-off answers before any default |
+| SeqMoE-style next-token expert prediction, offline on trace1 (24.7k tokens) | **dropped**: cold rank 0-1 recall of the next token's experts @2/@4/@8/@13: same-as-last-token 25/36/45/48%, recent frequency 22/35/47/56%, GRU sequence model 5/10/17/24%, memoryless MLP 13/21/31/38%. 512 experts top-10 change too much token to token (the published study on this model: 57-59% cov@10); usable K is far too low for a whole-step prefetch | the next-layer look-ahead (77-94%, limited by lead) stays the predictor |
+| Stand-in rule for rank 0-1, five arms on one build (20 Oct night; 8.5k speed run + code / reasoning / prose, every answer read) | off 54.4 / 38.6 tok/s (speed run / all requests), read wait 20.0 ms a window; safe (rank 1, stand-in within 1 logit, not in RAM) 55.5 / 44.8, 16.2 ms; r01 (ranks 0-1, within 1 logit, not in RAM) 56.0 / 46.1, 11.9 ms; **r01any (ranks 0-1, within 1 logit, even when in RAM) 57.7 / 47.4, 13.3 ms**; unlim (ranks 0-1, any stand-in, not in RAM) 63.0 / 56.1, 0.0 ms. Answers: off, safe, r01, r01any - working fenced code, 11:36 / 156 km, clean prose (the control itself wrote "foged"); **unlim degenerates**: code lost its indentation (IndentationError), reasoning lost closing braces in its LaTeX. The 1-logit margin is what keeps rank 0-1 stand-ins clean | candidate r01any: `STRATA_ROUTE_RAM_FLOOR=1 STRATA_ROUTE_RAM_FLOOR_RANK0=1 STRATA_ROUTE_RAM_FLOOR_ANYTIER=1` (margin STRATA_ROUTE_RAM_FLOOR_MARGIN=1 default); next the 210-question MMLU-Pro on it before any default |
+| Margin ladder for rank 0-1 stand-ins (ranks 0-1, any tier), then built back from the collapse (20 Oct night; speed run + code / reasoning / prose, every answer read) | all stand-ins (every miss): **collapse** (empty answers, "I need to write ..." loop); margin 8: collapse ("dep B" loop, leaked `</think>` loop); 5: collapse ("Trav 60 km/h" loop); 3: collapse ("Let's solve step-by step." / "salt, salt" loops); **2: degenerates** (code drops `]`: syntax errors, wrong expected output; prose "salt-b-ringsed", "storm-bed"); **1: clean**. Rank 0 exact + ranks 1-9 unlimited: short prompts clean but the 8.5k summary **stopped after 32 tokens** (the 10 Oct premature end). So both ranks need the 1-logit check; with SPEC E1 (rank 1 within 1 logit: 49/50 sums, 29/30 code; 2 logits: four arithmetic slips) 1 logit is the edge | **DEFAULT (setup.py, install config):** `STRATA_ROUTE_RAM_FLOOR=1` + `STRATA_ROUTE_RAM_FLOOR_ANYTIER=1` = rank 1 takes a stand-in only within 1 logit, rank 0 exact (E1). Rank-0 stand-ins (r01any) stay opt-in (`STRATA_ROUTE_RAM_FLOOR_RANK0=1`) until sums and MMLU-Pro are measured. 210-question MMLU-Pro on the new default running overnight on 8095 |
+| Default switched to r01any (user, 20 Oct night) | the rank-1-only default above was not among the measured winners (rank 1 only without ANYTIER gained little); r01any = ranks 0 and 1 within 1 logit, any tier: 57.7 / 47.4 tok/s vs 54.4 / 38.6, every answer clean | setup.py and the install config add `STRATA_ROUTE_RAM_FLOOR_RANK0=1`; 210-question MMLU-Pro on it overnight on 8095 (rank 0 within 1 logit has no maths check yet: the GSM8K sums are next) |
+| Default back to E1 (20 Oct night) | under r01any the user saw `<|im_start|>user` leaked into a 13-token answer in a 94K-token API conversation (the 10 Oct full-stand-in leak); r01any was checked only up to 8.5K context | setup.py and the install config: `STRATA_ROUTE_RAM_FLOOR_RANK0=0` (rank 0 always exact, rank 1 within 1 logit). 8095 restarted on it with the request monitor on; the same long conversation is being repeated to confirm the leak is gone |
+| Rank 0-1 rule OFF by default (20 Oct night, user) | with E1 (rank 1 within 1 logit) a pi harness session right after restarts (card hit rate 59-85%) gave broken answers, read from the request monitor: "golden '90s rerds" then "H / H / H"; thinking "1 0 <" and "\r" with no answer; "hi" -> no answer. The web chat turn was clean. Not separated yet from the ranks 2-9 unlimited stand-ins, which replace 15-40% of picks on a cold card (vs ~5% warm) | engine default off again (STRATA_ROUTE_RAM_FLOOR unset = off), setup.py no longer writes the rule; 8095 on RAM_FLOOR=0 with the request monitor. Next: 210-question MMLU-Pro on this setting (no token cap, streamed), then a per-token cap on stand-ins for cold cards |
+| Rank 2 within 1 logit (21 Oct, user: "for rank 2 also logit 1") | the user saw issues with ranks 2-9 taking any stand-in (cold card after restarts) | install default: STRATA_ROUTE_RESIDENT_RANKS=3-9 + STRATA_ROUTE_RESIDENT_EDGE=1 (rank 2 replaced only by a stand-in within 1 logit, ranks 0-1 exact, 3-9 any); live on 8095 with the request monitor; not yet measured |
+| Conversation fill / preload / read-ahead depth (21 Oct, 45K document + follow-ups, 700 tokens a turn, rank 0-1 exact + rank 2 edge) | baseline decode waits 41% on rank 0-2 fetches (19.5 a token). **Read-ahead depth 1** (STRATA_IO_PREFETCH_DEPTH=1, 1 round): follow-ups 31.1 vs 31.3 tok/s, no change (82% of read-ahead is never used at either depth). **RAM fill** (STRATA_CONV_FILL, conversation's rank 0-2 experts into the RAM tier in the background): 29.4 vs 31.3, **lost**; it promoted only 3-349 of 768 (no free places, 4 a layer a window) and its reads added ~15 GB a turn on the drive decode waits on. **Follow-up preload** (STRATA_CONV_PRELOAD: decode usage seeded from every chunk the conversation read, then 4 swap rounds before decode, ~136 swaps): 2 rounds, follow-ups 30.2 vs 31.2 tok/s, first follow-up waits 13.1-14.7 vs 10.7-11.7 s, **lost**. Why: in a conversation that stays loaded the previous answer's swap rounds already fitted the card to what it uses NOW; whole-conversation counts displace recent-hot experts (recency predicts best, 20 Oct SeqMoE test), and the early swaps cost reads. Also found: the prompt-tail preload never runs on follow-ups ("prompt tail: none": the new message is read on the window path) | both stay opt-in, off. Next: the narrower variant - preload only when the card was NOT serving this conversation (restored from the prompt cache / after another conversation / after a restart), with the counts saved alongside the conversation |
+| 21 Oct, built and measured tonight (131K speed run: 8.5K prompt + 1000 tokens, then code / reasoning / prose; one run each, spread ~3 tok/s) | **look-ahead edge skip** (STRATA_LA_EDGE_SKIP, with STRATA_IO_DEMAND_FIRST): 56.4 / 34.8 / 39.4 / 31.3 vs 53.6 / 31.9 / 34.9 / 28.8 tok/s; read-ahead 16,968 -> 12,009 (used 32 -> 41%), decode SSD wait 4.68 -> 4.00 s, 46,667 rank-2 reads skipped; stale drops 12 (demand-first adds little). **Prefill stand-ins** (STRATA_PREFILL_STANDIN): 76-118-token prompts read 1.3-1.8 vs 2.3-2.8 s, 8.5K 15.1 vs 15.8 s, decode within noise, answers read clean (code, maths 11:36 / 156 km, prose, the 8.5K summary's thinking). **Restore**: restores were refused for RAM (3 of 4 returns to a 45K conversation, ~113 MiB short): the restore path now has the save path's give-back, and give-back frees the merged parked ranges in whole huge pages (THP=always: a partial-huge-page MADV_DONTNEED only defers the split; 0.73 GiB released, 1.41 GiB freed in whole huge pages, restore in 0.34 s). **Narrow preload** (after a restore only, counts saved as <session>.bin.conv): fired after the tail fix, return turn 12.7 s vs 20.3 s in an earlier restored return (one turn each). 50 -> 30 tok/s question: no regression - the 8.5K run is 53.6 tok/s at 131K (54.4 on 20 Oct); ~30 tok/s was short answers on fresh engines | DEFAULT ON: STRATA_LA_EDGE_SKIP, STRATA_PREFILL_STANDIN (with decode's stand-ins), STRATA_CONV_PRELOAD (after a restore). Opt-in: STRATA_IO_DEMAND_FIRST stale drop, STRATA_CONV_FILL (lost) |
+
+## 22 Oct: why the predicted rank 0-1 experts arrive late (code audit; built opt-in, NOT yet measured)
+
+The look-ahead's guesses are made one or two layers ahead (~1.1 ms a layer) and one 2.33 MB expert needs >= 0.7 ms of the drive.
+What the code does with a layer's guesses (expert_source.cpp, io_worker / expert_pool_dispatch_multi / prefetch):
+
+| Finding | Where | Effect |
+| --- | --- | --- |
+| The workers read the NEWEST guess first (`io_q_.back()`), and the dispatch queues dist 1 (the next layer) before dist 2 | io_worker; the warm loop over dist 1, 2 | when the queue is longer than the idle workers, the layer after next is read before the next layer |
+| Up to 8 guesses (one per worker, STRATA_IO_PF_THREADS default 8) are read at once, beside the decode's own demand reads; fewer threads were never tested (SPEC T16, 10 Oct, page-fault path: 16 threads, no better) | io_worker, set_io_prefetch | the drive shares its bandwidth: a right guess issued with two wrong ones lands after ~3 x 0.7 ms, past its layer; the current layer's demand read is slowed the same way (the "blob() waits on in-flight guesses" row). Precision sets arrival time, not only bytes |
+| Stale guesses are dropped only with STRATA_IO_DEMAND_FIRST | begin_layer | (21 Oct: only 12 stale drops - the queue is short; the in-flight sharing above is the main cost) |
+| Layer 0 of a window has no guess, layer 1 one layer of lead | the dist loop starts at the current layer | unmeasured share of the wait |
+| The published d=1 predictor (tools/predictor: rank 0-1 in the top 2 on 71.7% vs 55.3%, top 4 89.4% vs 74.4%) was never wired in | verify.cpp lookahead_node | more right guesses AND fewer wrong ones sharing the drive |
+
+Built, all opt-in (unset = as before):
+
+| Switch | What it does |
+| --- | --- |
+| STRATA_IO_ARRIVAL=1 | the request line gets, for layers 0-1 and 2+, each file-tier blob of the decode by what the read-ahead had done: landed in time / still being read / still queued / predicted but not kept / never predicted / staged by an earlier demand read. Measure this FIRST: it says which fix can help |
+| STRATA_IO_EDF=1 | decode guesses read next layer first (rank 0 before rank 1), stale ones (layer routed, or an older window) dropped unread; the prompt's guesses untouched |
+| STRATA_IO_PF_THREADS=1 or 2 (EXISTING setting, not new code) | at most that many guesses read at once (the demand reads stay on the decode's thread unless STRATA_IO_DEMAND_FIRST) |
+| STRATA_IO_PF_YIELD=1 | no guess starts while the decode's own demand reads run (no effect with STRATA_IO_DEMAND_FIRST, whose demand reads go through the workers) |
+| STRATA_LA_MODEL=<file> | the next-layer guess from the published predictor (export_la_model.py folds it into bf16 + bias; ~123 MiB of VRAM, allocated after the cache is sized: check the start log and the VRAM headroom; ~50 fewer cache slots if the budget is cut to make room) |
+
+A/B plan (alternated pairs on one binary, the 8.5K speed run and the 45K conversation, STRATA_DECODE_TIMING=1 for the read wait a window):
+1. Baseline vs baseline + STRATA_IO_ARRIVAL=1 (the counters cost a lock per demand read: check they change nothing).
+2. STRATA_IO_PF_THREADS=2, then =1 (existing setting); then + YIELD; then + EDF. Watch "still being read" fall and "landed in time" rise.
+3. The best of 2 + STRATA_LA_MODEL. Watch read-ahead used / unused and "never predicted".
+The switches change only which bytes are read when, never the routing; but greedy answers already differ between two default arms (stand-in choices follow the cache at that moment, see the note above), so read the answers rather than diff them.
+
+Simulated (tools/predictor/sim_readahead.py, 22 Oct; a model of the queue and a drive that shares 3.3 GB/s among the reads in flight,
+calibrated to the measured read wait ~8-11 ms a window and read-ahead use ~27%; NOT a measurement), two seeds agree within 0.5 points:
+
+| Arm | 13 cold misses a window (short context) | 29 a window (long conversation) |
+| --- | ---: | ---: |
+| EDF alone | +0.0% | +0.1% (the queue is rarely longer than the workers, as the 12 stale drops of 21 Oct said) |
+| STRATA_IO_PF_THREADS=2 (existing) | +1.5 to +1.8% | +9% |
+| STRATA_IO_PF_THREADS=1 (existing) | +3.1 to +3.3% | +17% |
+| PF_THREADS=1 + YIELD | +5.1 to +5.4% | +23% |
+| PF_THREADS=1 + EDF + YIELD | +5.4 to +5.8% | +24% |
+| LA_MODEL alone | +3.9 to +4.2% | +7 to +8.5% |
+| PF_THREADS=1 + EDF + YIELD + LA_MODEL | +9.3 to +9.7% | +31 to +32% |
+| bound: every miss predicted, no wrong guess | +17% | +40% |
+
+The model's risk: it assumes one 2.33 MB read gets the whole drive alone. If this NVMe needs several reads in flight to reach 3.3 GB/s,
+PF_THREADS=1 loses that and PF_THREADS=2 is the arm to keep: measure both.
+
+## 22 Oct: system trace simulator and five borrowed ideas (tools/sysim; a model, NOT measured)
+
+`tools/sysim/sysim.py` traces every decode task (kernels, expert reads, copies, host hand-offs, CPU expert jobs) on a generic machine
+whose links (VRAM, PCIe, RAM, NVMe) are shared max-min fairly; it reports the critical path, who waited on whom, sharing losses,
+utilisation and the gain from a 1.5x faster resource, and writes a Perfetto trace and an HTML timeline. Calibrated: 44-46 ms a window
+against 47.2 ms measured (20 Oct). `--waterfall` goes from the ideal machine to today one constraint at a time. Its two largest GPU
+terms (kernels at 0.70 of VRAM bandwidth, 3 us a graph node) are ASSUMED: only their sum (~25 ms a window) is measured - measure the
+split with STRATA_DECODE_STAGE_TIMERS=1 before acting on it.
+
+`tools/sysim/ideas.py`, mean of 3 seeds, 40 windows (tok/s change; "fixes" = PF_THREADS=1 + YIELD + EDF + LA_MODEL + zero-copy):
+
+| Idea | short, on today | short, on fixes | long, on today | long, on fixes |
+| --- | ---: | ---: | ---: | ---: |
+| 1 cost-aware prefetch (Cao et al.): read a guess only at confidence >= 0.6 | +18% | +10% | +29% | +15% |
+| 1 the same if confidence separates poorly (sep 0.1) | +14% | +8% | +21% | +11% |
+| 2 multi-history predictor: 3-ahead guesses at recall 0.3 | 0% | +4% | 0% | -4% |
+| 3 better caching: 25% fewer cold misses | +13% | +12% | +38% | +25% |
+| 4 pacing guess starts (Kingman) | 0% | 0% | +1% | +1% |
+| 5 row-chunk streaming of cold reads, 4 chunks (#19; bit-planes do not apply to IQ3_S's grid codes) | +7% | +4% | +10% | +4% |
+| 1 + 4 + 5 | +27% | +12% | +41% | +18% |
+| 1 + 2 + 3 + 4 + 5 | +37% | +19% | +68% | +32% |
+
+CAUTION on idea 1: a confidence gate on the read-ahead was measured with no net gain (Tested - keep out: 49.0 vs 49.6 tok/s, the
+CPU look-ahead's gate). The simulated gain needs confidence that separates right from wrong guesses; check that on traces (the GPU
+look-ahead's route_pred_weights against the routed experts) before building it. Idea 3 is the cache policy (trace replay #13: a fast
+LFU doubled rank 0-1 hits against a fixed set; LFRU lost live) - its value here says the RAM tier's policy is worth a trace study.
+Ideas 2 and 4 do not pay in the model: more lead costs more wrong guesses than it saves; with fair sharing, bursts are not the cost.
+
+Idle time as waste (tools/sysim/idle.py; model). Per decode window today / with the read-ahead fixes: GPU idle 14.2 / 8.3 ms (32 / 22%;
+~2 ms of it in ~40 gaps under 50 us = the per-layer host hand-off, the rest mostly gaps over 0.5 ms waiting on demand reads); drive idle
+10.8 / 15.7 ms (25 / 41%, while the GPU computes); CPU pool 69 / 65%, host 88 / 91%, copy engine 95 / 94% idle (cheap resources: their
+idle is spare, not waste). Theory of Constraints: keep the constraint (the GPU) busy; use the drive's idle time for work that lowers
+FUTURE GPU waits. Simulated filler: RAM-tier promotions read only while the drive is otherwise idle, one thread, lowest priority:
+
+| promotion pieces | share of promotions that save a later cold read | short, on today / on fixes | long, on today / on fixes |
+| --- | ---: | ---: | ---: |
+| whole blobs (2.33 MB) | 10% | +1% / +1% | -1% / -3% |
+| whole blobs | 30% | +13% / +16% | +12% / +7% |
+| whole blobs | 50% | +23% / +20% | +23% / +19% |
+| 0.29 MB pieces (steps aside sooner) | 10% | +3% / +4% | +4% / +3% |
+| 0.29 MB pieces | 30% | +8% / +13% | +11% / +10% |
+| 0.29 MB pieces | 50% | +12% / +19% | +17% / +17% |
+
+Not modelled: a promotion into a FULL tier evicts an expert that may be needed (STRATA_CONV_FILL lost partly for that: "no free
+places", and its reads were not idle-gated). The usefulness share is the open number: measure it on trace1 (which experts a recency /
+frequency rule would promote, and how many of them a later window then misses cold), before building.
+
+The usefulness check, built: `tools/predictor/promote_check.py <trace>` replays a STRATA_ROUTER_TRACE window by window (VRAM and RAM
+tiers seeded from the first 20% as the profile ranks them, VRAM swap rounds with decay 0.7 / 12 swaps / gain 1.5) and, for recency,
+frequency and recency+frequency rules at 5-22 promotions a window, reports the useful share (the sysim fill_useful), cold reads saved,
+cold reads CAUSED by the evictions a full tier needs, and the net change; it prints the matching sysim --set line. Checked only on a
+synthetic RTR1 trace (--synthetic): useful share falls with the budget (31% at 5, 11% at 22), evictions cause more cold reads as the
+budget grows, and with a tier that has room nothing is caused (29% fewer cold reads). On this box (trace1, ~8,500 windows, ~10 min):
+  python tools/predictor/promote_check.py /mnt/nvme/strata-data/traces/trace1.bin --ram 450     (the 1 GiB tier)
+  python tools/predictor/promote_check.py /mnt/nvme/strata-data/traces/trace1.bin --ram 4400    (a 10 GiB tier)
